@@ -1,0 +1,19 @@
+{
+	"luci-app-fm350backup": {
+		"description": "FM350 modem backup",
+		"read": {
+			"ubus": {
+				"luci.fm350backup": [ "status", "log", "diagnose" ]
+			}
+		},
+		"write": {
+			"ubus": {
+				"luci.fm350backup": [ "start_dump", "start_stream", "cancel", "delete_backup", "download", "install_da" ]
+			},
+			"cgi-io": [ "upload" ],
+			"file": {
+				"/tmp/fm350backup-da.upload": [ "write" ]
+			}
+		}
+	}
+}

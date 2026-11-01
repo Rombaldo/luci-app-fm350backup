@@ -1,0 +1,74 @@
+#!/bin/sh
+# rpcd backend for luci-app-fm350backup. Exposes the fm350-backup driver to LuCI.
+RUN=/tmp/fm350backup
+DRV=/usr/libexec/fm350-backup
+
+launch() {   # запустить команду драйвера отдельно от rpcd
+	mkdir -p "$RUN"
+	setsid "$DRV" "$@" </dev/null >/dev/null 2>&1 &
+}
+
+case "$1" in
+list)
+	cat <<'EOF'
+{ "status": {}, "log": {}, "start_dump": { "path": "" }, "start_stream": {}, "cancel": {}, "delete_backup": { "path": "" }, "download": { "path": "" }, "diagnose": {}, "install_da": { "name": "" } }
+EOF
+	;;
+call)
+	case "$2" in
+	status)
+		"$DRV" status 2>/dev/null || echo '{"error":"driver failed"}'
+		;;
+	log)
+		python3 - "$RUN" <<'PY'
+import json, os, sys
+run = sys.argv[1]
+def tail(p):
+    try:
+        with open(p, "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - 8000))
+            return f.read().decode("utf-8", "replace")
+    except OSError:
+        return ""
+print(json.dumps({"dump": tail(run + "/dump.log")}))
+PY
+		;;
+	start_dump)
+		input=$(cat)
+		path=$(echo "$input" | jsonfilter -e '@.path' 2>/dev/null)
+		launch dump "$path"
+		echo '{"started":true}'
+		;;
+	start_stream)
+		launch stream
+		echo '{"started":true}'
+		;;
+	cancel)
+		"$DRV" cancel
+		echo '{"ok":true}'
+		;;
+	diagnose)
+		"$DRV" diagnose
+		;;
+	download)
+		input=$(cat)
+		path=$(echo "$input" | jsonfilter -e '@.path' 2>/dev/null)
+		"$DRV" download "$path"
+		;;
+	install_da)
+		input=$(cat)
+		name=$(echo "$input" | jsonfilter -e '@.name' 2>/dev/null)
+		"$DRV" install-da "$name"
+		;;
+	delete_backup)
+		input=$(cat)
+		path=$(echo "$input" | jsonfilter -e '@.path' 2>/dev/null)
+		"$DRV" delete "$path"
+		;;
+	*)
+		echo '{"error":"unknown method"}'
+		;;
+	esac
+	;;
+esac

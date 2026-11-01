@@ -1,0 +1,21 @@
+# macOS / editor junk
+.DS_Store
+._*
+# python build junk
+__pycache__/
+*.pyc
+*.orig
+# never commit the proprietary loader or any real modem dump
+files/etc/fm350backup/kit/*.bin
+files/etc/fm350backup/kit/*.auth
+*.tar
+*.tar.gz
+*.run
+# Загрузчики DA и прочее, что не публикуется
+/vendor/
+# Результаты сборки
+/build/
+/dist/
+# Сведения о подключённом модеме, mtkclient пишет их сам
+hwparam.json
+.state

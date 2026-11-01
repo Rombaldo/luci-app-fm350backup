@@ -1,0 +1,3 @@
+config fm350backup 'main'
+	# GPIO that powers the modem on this board (Huasifei WH3000 Pro: 'modem_power').
+	option power_gpio 'modem_power'

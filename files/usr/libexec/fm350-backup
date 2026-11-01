@@ -1,0 +1,1123 @@
+#!/usr/bin/env python3
+# Полный дамп памяти модема FM350-GL на роутере с OpenWrt (Huasifei WH3000 Pro и похожие).
+#
+# Только читает: ловит загрузчик модема и копирует все разделы NAND на флешку или сразу
+# в браузер (на роутере ничего не хранится). Браузеру данные отдаёт сама программа, а не
+# uhttpd: проверено, что uhttpd убивает CGI через script_timeout (60 с), даже когда данные идут,
+# а для браузера это выглядит как успешное скачивание обрезанного файла. Команды:
+#   status            одна строка JSON: модем, флешки, ход работы, сохранённые дампы
+#   dump <папка>      снять дамп на примонтированную флешку
+#   stream            снять дамп и отдать его браузеру через свой порт
+#   download <папка>  отдать браузеру сохранённый дамп через свой порт
+#   diagnose          проверить модем (только чтение), одна строка JSON
+#   cancel            остановить
+#   delete <папка>    удалить сохранённый дамп
+#   install-da <имя>  положить загруженный страницей файл DA к остальным
+#
+# После дампа модем остаётся в загрузчике (0e8d:2000). Вернуть его может только выключение
+# роутера из розетки: переключение питания через GPIO проверено, модем после него не поднимается.
+import glob
+import hashlib
+import io
+import json
+import os
+import re
+import secrets
+import select
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tarfile
+import termios
+import time
+
+sys.dont_write_bytecode = True         # не тратить постоянную память роутера на .pyc
+SHARE = "/usr/share/fm350backup"
+MTK = SHARE + "/mtkclient"
+KIT = "/etc/fm350backup/kit"           # файлы DA кладёт пользователь, в публичной сборке их нет
+DA_UPLOAD = "/tmp/fm350backup-da.upload"   # сюда страница загружает файл, путь разрешён в ACL
+DA_MAX_SIZE = 16 * 1024 * 1024
+PYLIB = SHARE + "/pylib"
+if os.path.isdir(PYLIB) and PYLIB not in sys.path:
+    sys.path.insert(0, PYLIB)
+IDENTITY = "/etc/fm350backup/modems.json"
+RUN = "/tmp/fm350backup"
+STATE = RUN + "/state.json"
+LOG = RUN + "/dump.log"
+LOCK = RUN + "/dump.pid"
+FIFODIR = RUN + "/fifo"
+MODEM_CACHE = RUN + "/modem.json"
+VID = "0e8d"
+MODES = {
+    "7127": "working", "7126": "working",
+    "00ad": "fallback", "2000": "bootloader", "2001": "bootloader",
+    "0003": "brom",
+}
+DA_REJECTED = ("DAA_SIG_VERIFY_FAILED", "Error on uploading da data")
+SLA_ENABLED = "FM350: SLA is enabled"
+BOOTED = "Successfully booted to stage 2"
+REBOOT_SECONDS = 90                # столько модем возвращается на USB после перезагрузки
+NEED_SPACE = 1100 * 1024 * 1024    # разделы и full_dump.img
+OPERATORS = {"25001": "МТС", "25002": "MegaFon", "25011": "Yota", "25020": "T2", "25099": "Билайн"}
+RAT = {"0": "2G", "2": "3G", "7": "LTE", "11": "5G", "12": "5G", "13": "5G"}
+
+
+def version():
+    """Номер версии: файл кладёт сборка; без него - установка не из комплекта."""
+    try:
+        with open(SHARE + "/VERSION") as f:
+            return f.read().strip()
+    except OSError:
+        return "dev"
+
+
+def uci(opt, default=""):
+    try:
+        out = subprocess.run(["uci", "-q", "get", "fm350backup.main." + opt],
+                             capture_output=True, text=True).stdout.strip()
+        return out or default
+    except OSError:
+        return default
+
+
+def modem():
+    """(имя на шине, idProduct) модема MediaTek на любом USB-порту роутера."""
+    for d in sorted(glob.glob("/sys/bus/usb/devices/*")):
+        try:
+            with open(d + "/idVendor") as f:
+                if f.read().strip() == VID:
+                    with open(d + "/idProduct") as g:
+                        return os.path.basename(d), g.read().strip()
+        except OSError:
+            pass
+    return None, None
+
+
+def read_state():
+    try:
+        return json.load(open(STATE))
+    except (OSError, ValueError):
+        return {}
+
+
+def write_state(st):
+    os.makedirs(RUN, exist_ok=True)
+    tmp = STATE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(st, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, STATE)
+
+
+def running_pid():
+    try:
+        pid = int(open(LOCK).read().split()[0])
+    except (OSError, ValueError, IndexError):
+        return 0
+    try:
+        os.kill(pid, 0)
+        return pid
+    except OSError:
+        return 0
+
+
+def list_das():
+    """Загрузчики DA, новые первыми. Следующий пробуется, если модем отверг предыдущий."""
+    das = []
+    for path in glob.glob(KIT + "/*.bin"):
+        try:
+            with open(path, "rb") as f:
+                if f.read(32).startswith(b"MTK_DOWNLOAD_AGENT"):
+                    das.append(path)
+        except OSError:
+            pass
+    return sorted(das, reverse=True)
+
+
+def is_da_file(path):
+    with open(path, "rb") as f:
+        return f.read(32).startswith(b"MTK_DOWNLOAD_AGENT")
+
+
+def safe_da_name(name):
+    """Имя файла без пути и странных символов, всегда .bin."""
+    base = re.sub(r"[^A-Za-z0-9._-]", "_", os.path.basename(name or "").strip()).lstrip(".")
+    if not base.lower().endswith(".bin"):
+        base = (base or "DA") + ".bin"
+    return base
+
+
+def file_md5(path):
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def install_da(upload, name):
+    """Положить загруженный файл к остальным DA. Возвращает имя файла, при ошибке RuntimeError."""
+    if not os.path.isfile(upload):
+        raise RuntimeError("Файл не загрузился, попробуй ещё раз.")
+    if os.path.getsize(upload) > DA_MAX_SIZE or not is_da_file(upload):
+        raise RuntimeError("Это не файл DA. Нужен файл из пакета прошивки, обычно download_agent/DA_BR.bin.")
+    os.makedirs(KIT, exist_ok=True)
+    md5 = file_md5(upload)
+    for old in list_das():
+        if file_md5(old) == md5:
+            return os.path.basename(old)
+    base = safe_da_name(name)
+    target, n = os.path.join(KIT, base), 1
+    while os.path.exists(target):        # в разных прошивках файл называется одинаково
+        target = os.path.join(KIT, "%s_%d.bin" % (base[:-4], n))
+        n += 1
+    tmp = target + ".tmp"
+    shutil.copyfile(upload, tmp)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, target)
+    return os.path.basename(target)
+
+
+def cmd_install_da():
+    name = sys.argv[2] if len(sys.argv) > 2 else ""
+    try:
+        if running_pid():
+            raise RuntimeError("Сначала дождись конца текущей работы.")
+        print(json.dumps({"ok": True, "name": install_da(DA_UPLOAD, name)}, ensure_ascii=False))
+    except (RuntimeError, OSError) as e:
+        print(json.dumps({"error": str(e)}, ensure_ascii=False))
+    finally:
+        try:
+            os.remove(DA_UPLOAD)
+        except OSError:
+            pass
+    return 0
+
+
+# expdb (журнал сбоев) и pmt (таблица разделов) читаются последними: сбой на них не должен
+# лишить дамп настоящих разделов.
+LAST = ("pmt", "expdb")
+
+
+def load_partitions():
+    """Все разделы в порядке адресов: [(имя, начало, размер)]."""
+    parts = []
+    with open(SHARE + "/partitions.txt") as f:
+        for line in f:
+            line = line.split("#", 1)[0].split()
+            if len(line) == 3:
+                parts.append((line[0], int(line[1], 16), int(line[2], 16)))
+    return sorted(parts, key=lambda p: p[1])
+
+
+def want_bytes(name, size):
+    """Сколько байт просить у DA: pmt полной длины он отвергает, и обмен сбивается до конца захода."""
+    return size - 1 if name == "pmt" else size
+
+
+def dump_sequence(parts):
+    """Порядок чтения: обычные разделы, затем pmt и expdb."""
+    return [p for p in parts if p[0] not in LAST] + \
+           [p for n in LAST for p in parts if p[0] == n]
+
+
+# ---------------------------------------------------------------- AT-запросы (только чтение)
+
+def at_query(port, cmd, wait=3.0):
+    """Ответ модема на одну AT-команду или "" при тишине."""
+    fd = os.open(port, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+    try:
+        t = termios.tcgetattr(fd)
+        t[0] = t[1] = t[3] = 0
+        t[2] = termios.CS8 | termios.CREAD | termios.CLOCAL
+        termios.tcsetattr(fd, termios.TCSANOW, t)
+        termios.tcflush(fd, termios.TCIOFLUSH)
+        os.write(fd, (cmd + "\r").encode())
+        buf, end = b"", time.time() + wait
+        while time.time() < end:
+            if select.select([fd], [], [], 0.2)[0]:
+                buf += os.read(fd, 4096)
+                if b"OK\r\n" in buf or b"ERROR" in buf:
+                    break
+        return buf.decode("ascii", "replace")
+    finally:
+        os.close(fd)
+
+
+def find_at_port():
+    for port in sorted(glob.glob("/dev/ttyUSB*") + glob.glob("/dev/ttyACM*")):
+        try:
+            if "OK" in at_query(port, "AT", 1.0):
+                return port
+        except OSError:
+            pass
+    return None
+
+
+AT_CARD = ["ATI", "AT+GTPKGVER?", "AT+CGSN", "AT+CFSN", "AT+CPIN?", "AT+CSQ", "AT+COPS?",
+           "AT+GTDIPCMODE?", "AT+GTSENRDTEMP=1"]
+
+
+def parse_card(r):
+    """Сведения для карточки модема из ответов на AT_CARD."""
+    card = {}
+    m = re.search(r"Model:\s*(\S+)", r.get("ATI", ""))
+    if m:
+        card["model"] = m.group(1)
+    m = re.search(r'"([^"]+)"', r.get("AT+GTPKGVER?", ""))
+    if m:
+        card["firmware"] = m.group(1)
+    m = re.search(r"\b(\d{15})\b", r.get("AT+CGSN", ""))
+    if m:
+        card["imei"] = m.group(1)
+    m = re.search(r'\+CFSN:\s*"([^"]+)"', r.get("AT+CFSN", ""))
+    if m:
+        card["serial"] = m.group(1)
+    card["sim"] = "READY" in r.get("AT+CPIN?", "")
+    m = re.search(r"\+CSQ:\s*(\d+)", r.get("AT+CSQ", ""))
+    if m and m.group(1) != "99":
+        v = int(m.group(1))
+        card["signal"] = "слабый" if v < 10 else "средний" if v < 18 else "хороший"
+    m = re.search(r'\+COPS:\s*\d+,\d+,"([^"]+)"(?:,(\d+))?', r.get("AT+COPS?", ""))
+    if m:
+        card["operator"] = OPERATORS.get(m.group(1), m.group(1))
+        card["rat"] = RAT.get(m.group(2) or "", "")
+    m = re.search(r"\+GTDIPCMODE:\s*([\d,\s]+)", r.get("AT+GTDIPCMODE?", ""))
+    if m:
+        card["dipc"] = m.group(1).replace(" ", "").strip()
+        card["dipc_ok"] = card["dipc"].split(",")[0] != "1"   # 1 = режим PCIe: в USB-слоте порты могут не появиться
+    m = re.search(r"\+GTSENRDTEMP:\s*\d+,\s*(\d+)", r.get("AT+GTSENRDTEMP=1", ""))
+    if m:
+        card["temp_c"] = round(int(m.group(1)) / 1000)
+    return card
+
+
+def read_identity():
+    try:
+        with open(IDENTITY) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def remember_identity(**kw):
+    """Запомнить IMEI, прошивку и ID чипа. Файл пишется, только если что-то изменилось."""
+    kw = {k: v for k, v in kw.items() if v}
+    old = read_identity()
+    if kw.get("imei") and old.get("imei") and kw["imei"] != old["imei"]:
+        old = {}                        # другой модем: прежний ID чипа к нему не относится
+    new = dict(old, **kw)
+    if new != old:
+        os.makedirs(os.path.dirname(IDENTITY), exist_ok=True)
+        tmp = IDENTITY + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(new, f)
+        os.replace(tmp, IDENTITY)
+    return new
+
+
+def modem_card(pid):
+    """Карточка модема: свежая в рабочем режиме (не чаще раза в 20 с), иначе последняя известная."""
+    card, known = {}, read_identity()
+    if MODES.get(pid) == "working" and not running_pid():
+        try:
+            with open(MODEM_CACHE) as f:
+                c = json.load(f)
+            if c.get("pid") == pid and time.time() - c.get("t", 0) < 20:
+                return c["card"]
+        except (OSError, ValueError, KeyError):
+            pass
+        port = find_at_port()
+        if port:
+            r = {}
+            for cmd in AT_CARD:
+                try:
+                    r[cmd] = at_query(port, cmd)
+                except OSError:
+                    r[cmd] = ""
+            card = parse_card(r)
+            known = remember_identity(imei=card.get("imei"), firmware=card.get("firmware"),
+                                      model=card.get("model"), serial=card.get("serial"))
+            card["live"] = True
+    for k, v in known.items():
+        card.setdefault(k, v)
+    if card.get("live"):
+        os.makedirs(RUN, exist_ok=True)
+        with open(MODEM_CACHE, "w") as f:
+            json.dump({"pid": pid, "t": time.time(), "card": card}, f)
+    return card
+
+
+def usb_drops(dmesg):
+    """Сколько раз отключался работающий модем: у него есть порты ttyUSB. Флешки и этап загрузчика не считаются."""
+    working, drops = set(), 0
+    for line in dmesg.splitlines():
+        m = re.search(r"usb (\S+): GSM modem .* attached", line)
+        if m:
+            working.add(m.group(1))
+            continue
+        m = re.search(r"usb (\S+): USB disconnect", line)
+        if m and m.group(1) in working:
+            working.discard(m.group(1))
+            drops += 1
+    return drops
+
+
+def program_reboots(log, now=None):
+    """(сколько раз модем перезагрузил пакет 5gmodem, секунд с последнего раза или None)."""
+    found = re.findall(r"^\w+ (\w+ +\d+ [\d:]+ \d+) .*5gmodem.*(?:CFUN=1,1|rebooting the module|power-cycled)",
+                       log, re.M)
+    if not found:
+        return 0, None
+    try:
+        last = time.mktime(time.strptime(re.sub(" +", " ", found[-1]), "%b %d %H:%M:%S %Y"))
+    except ValueError:
+        return len(found), None
+    return len(found), (time.time() if now is None else now) - last
+
+
+def usb_resets():
+    """(обрывы USB без перезагрузок 5gmodem, перезагрузки 5gmodem, модем ещё перезагружается).
+    Дамп сам перезапускает модем, поэтому после дампа обрывы не считаются."""
+    def run(cmd):
+        try:
+            return subprocess.run(cmd, capture_output=True, text=True).stdout
+        except OSError:
+            return ""
+    reboots, ago = program_reboots(run(["logread"]))
+    rebooting = ago is not None and ago < REBOOT_SECONDS
+    if read_state():
+        return 0, reboots, rebooting
+    return max(usb_drops(run(["dmesg"])) - reboots, 0), reboots, rebooting
+
+
+def cmd_diagnose():
+    if SHARE not in sys.path:
+        sys.path.insert(0, SHARE)
+    import fm350diag
+    if running_pid():
+        print(json.dumps({"error": "Сначала дождись конца текущей работы."}))
+        return 0
+    pid = modem()[1]
+    mode = MODES.get(pid, "none" if not pid else "unknown")
+    responses = None
+    if mode == "working":
+        port = find_at_port()
+        if port:
+            responses = {}
+            for cmd in fm350diag.COMMANDS:
+                try:
+                    responses[cmd] = at_query(port, cmd)
+                except OSError:
+                    responses[cmd] = ""
+    drops, reboots, rebooting = usb_resets()
+    print(json.dumps(fm350diag.diagnose(mode, responses, drops, reboots, rebooting), ensure_ascii=False))
+    return 0
+
+
+# ---------------------------------------------------------------- состояние
+
+def cmd_status():
+    name, pid = modem()
+    mount_new_drives()
+    print(json.dumps({
+        "version": version(),
+        "pid": pid,
+        "mode": MODES.get(pid, "none" if not pid else "unknown"),
+        "card": modem_card(pid),
+        "ready": bool(list_das()) and os.path.exists(MTK + "/mtk.py"),
+        "da_count": len(list_das()),
+        "das": [os.path.basename(p) for p in list_das()],
+        "da_dir": KIT,
+        "gpio": os.path.exists(gpio_path()),
+        "running": bool(running_pid()),
+        "last": read_state(),
+        "drives": usb_mounts(),
+        "backups": list_backups(),
+    }))
+    return 0
+
+
+def usb_mounts():
+    """Примонтированные флешки и USB-диски с записью."""
+    res = []
+    try:
+        with open("/proc/mounts") as f:
+            for line in f:
+                dev, mp, fs, opts = (line.split() + ["", "", "", ""])[:4]
+                if not re.match(r"/dev/sd[a-z]", dev):
+                    continue
+                try:
+                    free = shutil.disk_usage(mp).free // (1024 * 1024)
+                except OSError:
+                    continue
+                res.append({"path": mp, "dev": dev, "fs": fs, "free_mb": free,
+                            "writable": "rw" in opts.split(",")})
+    except OSError:
+        pass
+    return res
+
+
+def mount_new_drives():
+    """Подключить только что вставленную флешку. Попытка для каждой - не чаще раза в минуту."""
+    mounted = {u["dev"] for u in usb_mounts()}
+    for sysdev in glob.glob("/sys/block/sd*"):
+        name = os.path.basename(sysdev)
+        partitions = sorted(os.path.basename(p) for p in glob.glob(sysdev + "/" + name + "*"))
+        for part in partitions or [name]:
+            dev = "/dev/" + part
+            mark = RUN + "/mount_" + part
+            if dev in mounted:
+                continue
+            try:
+                if time.time() - os.path.getmtime(mark) < 60:
+                    continue
+            except OSError:
+                pass
+            os.makedirs(RUN, exist_ok=True)
+            open(mark, "w").close()
+            mp = "/mnt/" + part
+            os.makedirs(mp, exist_ok=True)
+            subprocess.run(["mount", dev, mp], capture_output=True)
+
+
+def known_bases():
+    """Где могут лежать дампы: на флешках и в старой папке роутера от прежних версий."""
+    return ["/root/fm350-backup"] + [os.path.join(u["path"], "fm350-backup") for u in usb_mounts()]
+
+
+def dir_size_mb(d):
+    total = 0
+    for f in glob.glob(d + "/*"):
+        try:
+            total += os.path.getsize(f)
+        except OSError:
+            pass
+    return total // (1024 * 1024)
+
+
+def list_backups():
+    res = []
+    for base in known_bases():
+        for d in sorted(glob.glob(base + "/fm350_*"), reverse=True):
+            try:
+                with open(os.path.join(d, "manifest.json")) as f:
+                    m = json.load(f)
+            except (OSError, ValueError):
+                continue
+            m.pop("partitions", None)
+            m.update(path=d, name=os.path.basename(d), size_mb=dir_size_mb(d),
+                     has_image=os.path.exists(os.path.join(d, "full_dump.img")))
+            res.append(m)
+    return res
+
+
+def is_backup_dir(path):
+    """Только настоящая папка дампа в известном месте (защита удаления и скачивания)."""
+    p = os.path.normpath(path)
+    if not os.path.basename(p).startswith("fm350_") or not os.path.isdir(p):
+        return False
+    if not os.path.exists(os.path.join(p, "manifest.json")):
+        return False
+    return any(os.path.dirname(p) == b for b in known_bases())
+
+
+def cmd_delete():
+    path = sys.argv[2] if len(sys.argv) > 2 else ""
+    if not is_backup_dir(path):
+        print(json.dumps({"error": "not a backup folder: " + path}))
+        return 1
+    shutil.rmtree(path)
+    print(json.dumps({"ok": True, "deleted": path}))
+    return 0
+
+
+# ---------------------------------------------------------------- дамп
+
+POWER_NOTE = ("Чтобы модем снова заработал, выключи роутер из розетки на 10 секунд и включи. "
+              "Если модем стоит в USB-переходнике, достаточно выдернуть и вставить переходник.")
+
+
+def log(msg):
+    line = time.strftime("%H:%M:%S ") + msg
+    with open(LOG, "a") as f:
+        f.write(line + "\n")
+
+
+def mtk_env(stream=False):
+    env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
+    if stream:
+        env["FM350_QUEUE"] = "16"      # не больше 32 МБ в памяти, если браузер отстаёт от модема
+    if os.path.isdir(PYLIB):
+        env["PYTHONPATH"] = PYLIB
+    return env
+
+
+def gpio_path():
+    return "/sys/class/gpio/%s/value" % uci("power_gpio", "modem_power")
+
+
+def gpio_cycle(off=6):
+    """Передёрнуть питание модема, чтобы поймать его загрузчик. На этой плате 1 = выключено."""
+    try:
+        with open(gpio_path(), "w") as f:
+            f.write("1")
+        time.sleep(off)
+        # модем в USB-переходнике этот GPIO не выключает: он как был на шине, так и остался
+        still_on = modem()[0] is not None
+        with open(gpio_path(), "w") as f:
+            f.write("0")
+        if still_on:
+            log("gpio cycle had no effect, modem is still on USB")
+        return not still_on
+    except OSError as e:
+        log("gpio cycle failed: %r" % e)
+        return False
+
+
+def stop_services():
+    subprocess.run(["ifdown", "modem"], capture_output=True)
+    for s in ("5gmodem-sessionwatch", "5gmodem-mm-inhibit", "modemmanager"):
+        init = "/etc/init.d/" + s
+        if os.path.exists(init):
+            subprocess.run([init, "stop"], capture_output=True)
+    subprocess.run(["rmmod", "cdc_acm"], capture_output=True)
+    time.sleep(1)
+
+
+def check_modem():
+    """Перед дампом: модем должен быть в режиме, из которого загрузчик ловится."""
+    pid = modem()[1]
+    mode = MODES.get(pid)
+    if mode in ("working", "fallback"):
+        return pid
+    if mode == "bootloader":
+        raise RuntimeError("Модем остался в режиме загрузчика. " + POWER_NOTE)
+    if mode == "brom":
+        raise RuntimeError("Модем в режиме BROM: снимать дамп из него эта версия не умеет.")
+    raise RuntimeError("Модем не найден на USB. Выключи роутер из розетки на 10 секунд, включи и повтори.")
+
+
+def tail_from(path, offset):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            f.seek(offset)
+            return f.read()
+    except OSError:
+        return ""
+
+
+def catch_da(items, st, stream=False):
+    """Запустить mtkclient и поймать загрузчик, перебирая DA. Возвращает работающий процесс."""
+    das = list_das()
+    if not das:
+        raise RuntimeError("Нет файла DA. Загрузи его кнопкой на странице. Модем не тронут.")
+    stop_services()
+    rejected = 0
+    for da in das:
+        name = os.path.basename(da)
+        st["phase"] = "catch"; st["message"] = "Ловлю загрузчик модема"; st["da"] = name; write_state(st)
+        start = os.path.getsize(LOG)
+        logf = open(LOG, "a")
+        cmd = [sys.executable, "-u", "mtk.py", "--stock", "--loader", da, "multi",
+               ";".join(i % da for i in items)]
+        proc = subprocess.Popen(cmd, cwd=MTK, stdout=logf, stderr=subprocess.STDOUT, env=mtk_env(stream))
+        with open(LOCK, "w") as f:
+            f.write("%d\n%d" % (os.getpid(), proc.pid))
+        time.sleep(4)
+        log("power-cycling modem, DA " + name)
+        if not gpio_cycle():
+            st["message"] = "Выдерни и вставь модем или переходник с ним: роутер не может сам выключить его питание"
+            write_state(st)
+        end = time.time() + 180
+        while time.time() < end and proc.poll() is None:
+            text = tail_from(LOG, start)
+            if BOOTED in text:
+                m = re.findall(r"ME_ID:\s*([0-9A-Fa-f]{16,})", text)
+                if m:
+                    st["me_id"] = m[-1].upper()
+                    remember_identity(me_id=st["me_id"])
+                return proc
+            if SLA_ENABLED in text:
+                proc.terminate()
+                proc.wait()
+                raise RuntimeError("На этом модеме включена защита SLA: прочитать его штатным DA нельзя. "
+                                   "Обходить защиту программа не умеет. Модем не изменён.")
+            if any(x in text for x in DA_REJECTED):
+                log("DA rejected: " + name)
+                rejected += 1
+                break
+            time.sleep(1)
+        if proc.poll() is None:
+            proc.terminate()
+            proc.wait()
+    if rejected == len(das):
+        raise RuntimeError("Модем не принял ни один файл DA. Нужен файл из пакета прошивки именно для этого модема. "
+                           "Модем не изменён. " + POWER_NOTE)
+    raise RuntimeError("Не удалось поймать загрузчик модема. " + POWER_NOTE)
+
+
+def new_state(dest, parts, **extra):
+    identity = read_identity()
+    st = {"phase": "prepare", "message": "Подготовка", "dest": dest,
+          "total": sum(p[2] for p in parts), "done": 0, "finished": False, "error": "",
+          "parts": [{"name": n, "size": s, "bytes": 0, "done": False} for n, _, s in parts],
+          "started": time.time(), "imei": identity.get("imei", ""),
+          "firmware": identity.get("firmware", ""), "me_id": identity.get("me_id", ""),
+          "serial": identity.get("serial", "")}
+    st.update(extra)
+    return st
+
+
+def classify(parts, read_bytes):
+    """Итог чтения: (не хватает нужных, дополнено FF, pmt настоящий)."""
+    missing = [n for n, _, s in parts if n not in LAST and read_bytes.get(n, 0) < s]
+    padded = [n for n, _, s in parts if n in LAST and read_bytes.get(n, 0) < want_bytes(n, s)]
+    return missing, padded, "pmt" not in padded
+
+
+def finish_message(missing, padded, pmt_real, count):
+    if missing:
+        return "Дамп неполный: не прочитались разделы %s. %s" % (", ".join(missing), POWER_NOTE)
+    note = ""
+    if not pmt_real:
+        note = " Таблица pmt не прочиталась, поэтому заливать этот дамп целиком нельзя."
+    elif padded:
+        note = " Журнал сбоев expdb прочитан не целиком, для восстановления он не нужен."
+    return "Снято %d разделов из %d.%s %s" % (count, count, note, POWER_NOTE)
+
+
+def cmd_dump():
+    os.makedirs(RUN, exist_ok=True)
+    if running_pid():
+        print("already running", file=sys.stderr)
+        return 1
+    target = sys.argv[2] if len(sys.argv) > 2 else ""
+    with open(LOCK, "w") as f:
+        f.write(str(os.getpid()))
+    open(LOG, "w").close()
+    allparts = load_partitions()
+    parts = dump_sequence(allparts)
+    outdir = os.path.join(target, "fm350-backup", "fm350_" + time.strftime("%Y%m%d_%H%M%S"))
+    st = new_state("usb", parts, outdir=outdir)
+    write_state(st)
+    try:
+        drive = next((u for u in usb_mounts() if u["path"] == target), None)
+        if not drive:
+            raise RuntimeError("Флешка не найдена. Вставь её и выбери снова.")
+        if not drive["writable"]:
+            raise RuntimeError("Флешка открыта только для чтения. Проверь её на компьютере.")
+        if shutil.disk_usage(target).free < NEED_SPACE:
+            raise RuntimeError("На флешке мало места: нужно около 1,1 ГБ.")
+        check_modem()
+        os.makedirs(outdir)
+        log("dump to " + outdir)
+        items = ["ro 0x%x 0x%x %s --stock --loader %%s" % (start, want_bytes(n, size), os.path.join(outdir, n + ".bin"))
+                 for n, start, size in parts]
+        proc = catch_da(items, st)
+        monitor(proc, parts, outdir, st)
+        log("mtkclient exited rc=%s" % proc.poll())
+
+        read_bytes = {n: min(os.path.getsize(os.path.join(outdir, n + ".bin")), s)
+                      if os.path.exists(os.path.join(outdir, n + ".bin")) else 0 for n, _, s in parts}
+        missing, padded, pmt_real = classify(parts, read_bytes)
+        if not any(read_bytes.values()):
+            raise RuntimeError("Ничего не прочиталось. " + POWER_NOTE)
+
+        st["phase"] = "verify"; st["message"] = "Считаю контрольные суммы"; write_state(st)
+        for n, _, s in parts:                # недочитанное заполняется FF, файлы всегда полного размера
+            f = os.path.join(outdir, n + ".bin")
+            with open(f, "ab") as fh:
+                rem = s - read_bytes[n]
+                while rem > 0:
+                    k = min(rem, 1 << 20)
+                    fh.write(b"\xff" * k)
+                    rem -= k
+        full_ok = not missing and pmt_real
+        if full_ok:
+            with open(os.path.join(outdir, "full_dump.img"), "wb") as out:
+                for n, _, _ in allparts:
+                    with open(os.path.join(outdir, n + ".bin"), "rb") as fh:
+                        shutil.copyfileobj(fh, out, 1 << 20)
+        write_manifest(outdir, parts, read_bytes, st, missing, padded, pmt_real, full_ok)
+        if missing:
+            os.rename(outdir, outdir + "_incomplete")
+            st["outdir"] = outdir + "_incomplete"
+        st.update(phase="done", finished=True, complete=not missing, pmt_real=pmt_real, done=st["total"],
+                  message=finish_message(missing, padded, pmt_real, len(parts)))
+        write_state(st)
+        log("DONE missing=%s padded=%s" % (missing, padded))
+    except Exception as e:
+        st.update(phase="error", error=str(e), finished=True, message=str(e))
+        write_state(st)
+        log("ERROR " + repr(e))
+        try:
+            os.rmdir(outdir)           # пустая папка от неудачной попытки не нужна, непустая останется
+        except OSError:
+            pass
+        return 1
+    finally:
+        os.sync()
+        try:
+            os.remove(LOCK)
+        except OSError:
+            pass
+    return 0
+
+
+def monitor(proc, parts, outdir, st, stall=300):
+    last_done, last_change = -1, time.time()
+    while proc.poll() is None:
+        done, cur = 0, None
+        for i, (n, _, size) in enumerate(parts):
+            f = os.path.join(outdir, n + ".bin")
+            b = os.path.getsize(f) if os.path.exists(f) else 0
+            st["parts"][i].update(bytes=b, done=b >= want_bytes(n, size))
+            done += min(b, size)
+            if cur is None and b < want_bytes(n, size):
+                cur = n
+        if done != last_done:
+            last_done, last_change = done, time.time()
+        elif time.time() - last_change > stall:
+            log("no progress for %d s, stopping" % stall)
+            proc.terminate()
+            break
+        st.update(phase="dump", done=done, current=cur, message="Читаю раздел %s" % cur if cur else "Чтение разделов")
+        write_state(st)
+        time.sleep(2)
+    proc.wait()
+
+
+def md5_file(path):
+    h = hashlib.md5()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def write_manifest(outdir, parts, read_bytes, st, missing, padded, pmt_real, full_ok):
+    md5 = {n: md5_file(os.path.join(outdir, n + ".bin")) for n, _, _ in parts}
+    man = {"created": time.strftime("%Y-%m-%d %H:%M:%S"), "tool": "FM350 Backup для роутера",
+           "tool_version": version(), "imei": st.get("imei", ""), "serial": st.get("serial", ""),
+           "firmware": st.get("firmware", ""),
+           "me_id": st.get("me_id", ""), "da": st.get("da", ""), "complete": not missing,
+           "pmt_real": pmt_real, "full_dump_img": full_ok, "missing": missing, "padded": padded,
+           "partitions": [{"name": n, "size": s, "md5": md5[n], "read_bytes": read_bytes[n]} for n, _, s in parts]}
+    with open(os.path.join(outdir, "manifest.json"), "w") as f:
+        json.dump(man, f, indent=2, ensure_ascii=False)
+    with open(os.path.join(outdir, "md5sum.txt"), "w") as f:
+        for n in md5:
+            f.write("%s  %s.bin\n" % (md5[n], n))
+        if full_ok:
+            f.write("%s  full_dump.img\n" % md5_file(os.path.join(outdir, "full_dump.img")))
+
+
+def cmd_cancel():
+    try:
+        with open(LOCK) as f:
+            pids = f.read().split()
+        for p in reversed(pids):
+            try:
+                os.kill(int(p), signal.SIGTERM)
+            except (OSError, ValueError):
+                pass
+    except OSError:
+        pass
+    st = read_state()
+    st.update(phase="error", error="canceled", finished=True, message="Остановлено. " + POWER_NOTE)
+    write_state(st)
+    try:
+        os.remove(LOCK)
+    except OSError:
+        pass
+    return 0
+
+
+# ---------------------------------------------------------------- выдача браузеру
+
+def open_listener():
+    """Сокет на случайном порту, доступный по IPv4 и IPv6."""
+    try:
+        srv = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+        srv.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        srv.bind(("::", 0))
+    except OSError:
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.bind(("0.0.0.0", 0))
+    srv.listen(4)
+    return srv
+
+
+def wait_client(srv, token, filename, timeout=300):
+    """Дождаться запроса с верным токеном и отправить заголовки. Возвращает соединение или None."""
+    end = time.time() + timeout
+    while time.time() < end:
+        srv.settimeout(max(0.1, end - time.time()))
+        try:
+            conn, _ = srv.accept()
+        except socket.timeout:
+            return None
+        try:
+            conn.settimeout(5)
+            req = b""
+            while b"\r\n\r\n" not in req and len(req) < 8192:
+                d = conn.recv(4096)
+                if not d:
+                    break
+                req += d
+            line = req.split(b"\r\n", 1)[0].decode("ascii", "replace")
+            if ("t=" + token) not in line.split("?", 1)[-1].split(" ")[0].split("&"):
+                conn.sendall(b"HTTP/1.0 403 Forbidden\r\nConnection: close\r\n\r\n")
+                conn.close()
+                continue
+            conn.settimeout(120)       # браузер, который перестал читать, не держит дамп вечно
+            conn.sendall(("HTTP/1.0 200 OK\r\nContent-Type: application/x-tar\r\n"
+                          'Content-Disposition: attachment; filename="%s"\r\n'
+                          "Cache-Control: no-store\r\nConnection: close\r\n\r\n" % filename).encode())
+            return conn
+        except OSError:
+            conn.close()
+    return None
+
+
+class SockWriter:
+    def __init__(self, conn):
+        self.conn = conn
+
+    def write(self, data):
+        self.conn.sendall(data)
+        return len(data)
+
+
+class FifoMember:
+    """Файл архива из FIFO. read(n) всегда отдаёт ровно n байт, пока файл не кончится (иначе tarfile
+    падает с unexpected end of data): настоящие данные, а после конца раздела или гибели mtkclient - 0xFF."""
+
+    def __init__(self, path, size, alive, onchunk):
+        self.size, self.alive, self.onchunk = size, alive, onchunk
+        self.md5 = hashlib.md5()
+        self.served = self.real = 0
+        self.eof = self.saw_writer = False
+        self.grace = None
+        try:
+            self.fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        except OSError:
+            self.fd, self.eof = None, True
+
+    def _fifo(self, n):
+        """Очередная порция из FIFO: b"", если раздел кончился."""
+        while True:
+            r = select.select([self.fd], [], [], 1.0)[0]
+            if r:
+                d = os.read(self.fd, n)
+                if d:
+                    self.saw_writer = True
+                    return d
+                if self.saw_writer:
+                    return b""
+                time.sleep(0.05)       # писатель ещё не подключался
+            if not self.alive():
+                if self.grace is None:
+                    self.grace = time.time() + 5
+                elif time.time() > self.grace:
+                    return b""
+
+    def read(self, n=-1):
+        left = self.size - self.served
+        n = left if n is None or n < 0 or n > left else n
+        buf = b""
+        while len(buf) < n and not self.eof:
+            d = self._fifo(n - len(buf))
+            if d:
+                buf += d
+            else:
+                self.eof = True
+        self.real += len(buf)
+        buf += b"\xff" * (n - len(buf))
+        self.md5.update(buf)
+        self.served += len(buf)
+        if buf:
+            self.onchunk(len(buf))
+        return buf
+
+    def close(self):
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+
+
+def assemble_scripts(order):
+    """Скрипты, которые собирают full_dump.img: разделы лежат в архиве не по адресам."""
+    files = [n + ".bin" for n in order]
+    sh = "#!/bin/sh\n# Собирает full_dump.img из разделов в порядке адресов.\ncd \"$(dirname \"$0\")\" || exit 1\ncat " + \
+         " ".join(files) + " > full_dump.img\n"
+    bat = "@echo off\r\ncd /d \"%~dp0\"\r\ncopy /b " + "+".join(files) + " full_dump.img\r\n"
+    return sh, bat
+
+
+def add_bytes(tar, name, data, mode=0o600):
+    ti = tarfile.TarInfo(name)
+    ti.size = len(data)
+    ti.mtime = int(time.time())
+    ti.mode = mode
+    tar.addfile(ti, io.BytesIO(data))
+
+
+def stream_tar(out, parts, order, root, alive, progress, info):
+    """Записать архив дампа в out, читая разделы из FIFO. parts: name, size, want, fifo, optional.
+    Если нужный раздел не прочитан, дальше не идёт. Возвращает (не хватает, дополнено FF, pmt настоящий)."""
+    tar = tarfile.open(fileobj=out, mode="w|", format=tarfile.GNU_FORMAT)
+    md5lines, pj, missing, padded = [], [], [], []
+    for p in parts:
+        ti = tarfile.TarInfo(root + "/" + p["name"] + ".bin")
+        ti.size = p["size"]
+        ti.mtime = int(time.time())
+        ti.mode = 0o600
+        m = FifoMember(p["fifo"], p["size"], alive, lambda k, name=p["name"]: progress(k, name))
+        tar.addfile(ti, m)
+        m.close()
+        if m.real < p["want"]:
+            (padded if p["optional"] else missing).append(p["name"])
+        md5lines.append("%s  %s.bin" % (m.md5.hexdigest(), p["name"]))
+        pj.append({"name": p["name"], "size": p["size"], "md5": m.md5.hexdigest(), "read_bytes": m.real})
+        if missing:
+            break
+    pmt_real = not missing and "pmt" not in padded
+    add_bytes(tar, root + "/md5sum.txt", ("\n".join(md5lines) + "\n").encode())
+    add_bytes(tar, root + "/manifest.json", json.dumps(dict(
+        info, created=time.strftime("%Y-%m-%d %H:%M:%S"), tool="FM350 Backup для роутера", complete=not missing,
+        pmt_real=pmt_real, full_dump_img=False, missing=missing, padded=padded, partitions=pj),
+        indent=2, ensure_ascii=False).encode())
+    if not missing and pmt_real:
+        sh, bat = assemble_scripts(order)
+        add_bytes(tar, root + "/make_full_dump.sh", sh.encode(), 0o755)
+        add_bytes(tar, root + "/make_full_dump.bat", bat.encode(), 0o644)
+    tar.close()
+    return missing, padded, pmt_real
+
+
+def cmd_stream():
+    """Поймать загрузчик, оставить mtkclient писать разделы в FIFO и отдать их браузеру как .tar."""
+    os.makedirs(RUN, exist_ok=True)
+    if running_pid():
+        print("already running", file=sys.stderr)
+        return 1
+    with open(LOCK, "w") as f:
+        f.write(str(os.getpid()))
+    open(LOG, "w").close()
+    allparts = load_partitions()
+    parts = dump_sequence(allparts)
+    st = new_state("pc", parts)
+    write_state(st)
+    proc = srv = conn = None
+    try:
+        check_modem()
+        subprocess.run(["rm", "-rf", FIFODIR])
+        os.makedirs(FIFODIR)
+        items, ready = [], []
+        for n, start, size in parts:
+            fifo = os.path.join(FIFODIR, n + ".bin")
+            os.mkfifo(fifo)
+            want = want_bytes(n, size)
+            items.append("ro 0x%x 0x%x %s --stock --loader %%s" % (start, want, fifo))
+            ready.append({"name": n, "size": size, "want": want, "fifo": fifo, "optional": n in LAST})
+        srv = open_listener()
+        proc = catch_da(items, st, stream=True)
+        root = "fm350_" + time.strftime("%Y%m%d_%H%M%S")
+        token = secrets.token_hex(16)
+        st.update(phase="stream-ready", message="Начинается скачивание", stream_port=srv.getsockname()[1],
+                  stream_token=token, stream_name=root + ".tar")
+        write_state(st)
+        log("stream: DA ready, waiting for the browser")
+        conn = wait_client(srv, token, root + ".tar")
+        if not conn:
+            raise RuntimeError("Скачивание не началось. " + POWER_NOTE)
+        st.update(stream_token="", phase="dump", message="Читаю разделы")
+        write_state(st)
+        last = [0]
+
+        def progress(k, name):
+            st["done"] += k
+            if st["done"] - last[0] >= 4 << 20:
+                last[0] = st["done"]
+                st.update(current=name, message="Читаю раздел " + name)
+                write_state(st)
+
+        info = {"tool_version": version(), "imei": st["imei"], "serial": st["serial"], "firmware": st["firmware"],
+                "me_id": st["me_id"], "da": st["da"]}
+        missing, padded, pmt_real = stream_tar(SockWriter(conn), ready, [p[0] for p in allparts], root,
+                                               lambda: proc.poll() is None, progress, info)
+        conn.close()
+        if proc.poll() is None:
+            proc.terminate()
+            proc.wait()
+        log("stream: finished missing=%s padded=%s" % (missing, padded))
+        st.update(phase="done", finished=True, complete=not missing, pmt_real=pmt_real, done=st["total"],
+                  message=finish_message(missing, padded, pmt_real, len(parts)))
+        write_state(st)
+        return 0
+    except Exception as e:
+        msg = str(e) if isinstance(e, RuntimeError) else "Скачивание оборвалось. " + POWER_NOTE
+        if read_state().get("error") != "canceled":
+            st.update(phase="error", error=str(e), finished=True, message=msg, stream_token="")
+            write_state(st)
+        log("stream ERROR " + repr(e))
+        return 1
+    finally:
+        if proc and proc.poll() is None:
+            proc.terminate()
+        for c in (conn, srv):
+            if c:
+                c.close()
+        subprocess.run(["rm", "-rf", FIFODIR])
+        try:
+            os.remove(LOCK)
+        except OSError:
+            pass
+
+
+def cmd_download():
+    """Отдать браузеру сохранённый дамп одним .tar. Печатает порт и токен, а отдаёт фоновый процесс."""
+    path = os.path.normpath(sys.argv[2]) if len(sys.argv) > 2 else ""
+    if not is_backup_dir(path):
+        print(json.dumps({"error": "not a backup folder: " + path}))
+        return 1
+    srv = open_listener()
+    token = secrets.token_hex(16)
+    name = os.path.basename(path)
+    print(json.dumps({"port": srv.getsockname()[1], "token": token, "name": name + ".tar"}), flush=True)
+    if os.fork():
+        return 0
+    os.setsid()
+    null = os.open(os.devnull, os.O_RDWR)
+    for fd in (0, 1, 2):               # иначе rpcd ждёт конца скачивания
+        os.dup2(null, fd)
+    conn = wait_client(srv, token, name + ".tar", timeout=120)
+    if conn:
+        try:
+            with tarfile.open(fileobj=SockWriter(conn), mode="w|", format=tarfile.GNU_FORMAT) as tar:
+                for f in sorted(os.listdir(path)):
+                    tar.add(os.path.join(path, f), arcname=name + "/" + f)
+        except OSError:
+            pass
+        conn.close()
+    os._exit(0)
+
+
+def main():
+    cmds = {"status": cmd_status, "dump": cmd_dump,
+            "cancel": cmd_cancel, "stream": cmd_stream,
+            "delete": cmd_delete, "download": cmd_download, "diagnose": cmd_diagnose,
+            "install-da": cmd_install_da}
+    if len(sys.argv) < 2 or sys.argv[1] not in cmds:
+        print("usage: fm350-backup {status|dump <папка>|stream|cancel|delete <папка>|download <папка>|diagnose|install-da <имя>}", file=sys.stderr)
+        return 2
+    return cmds[sys.argv[1]]()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

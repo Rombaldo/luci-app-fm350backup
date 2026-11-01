@@ -1,0 +1,44 @@
+# Default partition table for the Fibocom FM350-GL (MT6880, NAND, 511 MB).
+# name  start  size   (hex, as reported by the download agent's READ-PARTITION-TABLE)
+# When the download agent returns its own table at dump time it is used instead and
+# this list is only the fallback for when that read fails.
+preloader    0x0         0x200000
+proinfo      0x200000    0x100000
+misc         0x300000    0x100000
+para         0x400000    0x100000
+expdb        0x500000    0x1400000
+nvcfg        0x1900000   0x2000000
+nvdata       0x3900000   0x2000000
+protect1     0x5900000   0x800000
+protect2     0x6100000   0x800000
+mcf1         0x6900000   0x800000
+mcf2         0x7100000   0x800000
+seccfg       0x7900000   0x100000
+boot_para    0x7a00000   0x200000
+nvram        0x7c00000   0x2000000
+md1img       0x9c00000   0x4000000
+md1dsp       0xdc00000   0xa00000
+spmfw        0xe600000   0x100000
+pi_img       0xe700000   0x100000
+dpm_1        0xe800000   0x100000
+dpm_2        0xe900000   0x100000
+medmcu_1     0xea00000   0x100000
+medmcu_2     0xeb00000   0x100000
+sspm_1       0xec00000   0x100000
+sspm_2       0xed00000   0x100000
+mcupm_1      0xee00000   0x100000
+mcupm_2      0xef00000   0x100000
+lk           0xf000000   0x100000
+lk2          0xf100000   0x100000
+tee1         0xf200000   0x100000
+tee2         0xf300000   0x100000
+boot         0xf400000   0x1000000
+rootfs       0x10400000  0x2000000
+loader_ext1  0x12400000  0x80000
+loader_ext2  0x12480000  0x80000
+mcf3         0x12500000  0x800000
+cfginfo      0x12d00000  0x100000
+mddata_bak   0x12e00000  0x2000000
+mdcode_bak   0x14e00000  0x4000000
+user_data    0x18e00000  0x7080000
+pmt          0x1fe80000  0x80000
