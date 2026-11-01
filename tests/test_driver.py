@@ -297,6 +297,16 @@ class BundledMtkclient(unittest.TestCase):
         self.assertNotIn("/root/mtk", self.text)
 
 
+class Menu(unittest.TestCase):
+    def test_page_has_its_own_parent_section(self):
+        # раздел Modem есть только там, где стоит другой пакет: без родителя LuCI страницу не покажет
+        with open(os.path.join(ROOT, "files", "usr", "share", "luci", "menu.d", "luci-app-fm350backup.json"),
+                  encoding="utf-8") as f:
+            menu = json.load(f)
+        self.assertEqual(menu["admin/modem"]["action"]["type"], "firstchild")
+        self.assertIn("admin/modem/fm350backup", menu)
+
+
 class NoLeftovers(unittest.TestCase):
     def test_interface_has_no_removed_controls(self):
         with open(os.path.join(ROOT, "files", "www", "luci-static", "resources", "view", "fm350backup",

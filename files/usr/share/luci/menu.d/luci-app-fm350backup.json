@@ -1,4 +1,12 @@
 {
+	"admin/modem": {
+		"title": "Modem",
+		"order": 30,
+		"action": {
+			"type": "firstchild",
+			"recurse": true
+		}
+	},
 	"admin/modem/fm350backup": {
 		"title": "FM350 Backup",
 		"order": 60,
@@ -7,7 +15,9 @@
 			"path": "fm350backup/backup"
 		},
 		"depends": {
-			"acl": [ "luci-app-fm350backup" ]
+			"acl": [
+				"luci-app-fm350backup"
+			]
 		}
 	}
 }
