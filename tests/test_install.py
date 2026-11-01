@@ -130,6 +130,37 @@ class Install(unittest.TestCase):
         self.assertNotEqual(out.returncode, 0)
         self.assertIn("нет ни apk, ни opkg", out.stderr)
 
+    def test_space_requirement(self):
+        self.manager("apk")
+        # среда без Python: только нужные инструменты и поддельный df
+        for tool in ("sh", "sed", "awk", "grep", "tar", "gzip", "mktemp", "curl", "cut", "mkdir", "rm", "cp", "mv",
+                     "chmod", "touch", "cat", "ls", "tr", "sleep", "uname", "date"):
+            found = shutil.which(tool)
+            if found and not os.path.exists(os.path.join(self.bin, tool)):
+                os.symlink(found, os.path.join(self.bin, tool))
+        sha = shutil.which("sha256sum")
+        if sha:
+            os.symlink(sha, os.path.join(self.bin, "sha256sum"))
+        else:
+            self.stub("sha256sum", '/usr/bin/shasum -a 256 "$@"\n')
+
+        def free(kb):
+            self.stub("df", 'echo "Filesystem 1K Used Available"\necho "overlay 100 0 %d"\n' % kb)
+
+        path = self.bin
+        free(19000)
+        out = self.run_install(path=path)
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("мало места", out.stderr)
+        free(21000)
+        self.assertEqual(self.run_install(path=path).returncode, 0)
+        # Python уже есть: хватает места на саму программу
+        self.stub("python3", "exit 0\n")
+        free(3500)
+        self.assertEqual(self.run_install(path=path).returncode, 0)
+        free(2000)
+        self.assertIn("мало места", self.run_install(path=path).stderr)
+
     def test_wrong_checksum_changes_nothing(self):
         self.manager("apk")
         self.publish(make_tar(), wrong_sum=True)

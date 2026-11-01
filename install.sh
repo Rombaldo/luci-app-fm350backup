@@ -15,8 +15,8 @@ SHARE="$R/usr/share/fm350backup"
 KIT="$R/etc/fm350backup/kit"
 MIN=2305                           # 23.05
 MAX=2512                           # 25.12
-NEED_PYTHON_KB=25000               # Python со всем нужным, замер на 25.12
-NEED_APP_KB=3000
+NEED_PYTHON_KB=17000               # Python около 13 МБ, замер на 25.12, остальное запас
+NEED_APP_KB=3000                   # программа и файл DA около 2 МБ
 REQUIRED="python3-light python3-logging python3-ctypes libusb-1.0-0"
 OPTIONAL="kmod-usb-serial-option kmod-usb-storage kmod-fs-vfat kmod-fs-exfat block-mount"
 
