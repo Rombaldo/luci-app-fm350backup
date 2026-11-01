@@ -121,14 +121,9 @@ install_packages() {
 	for p in $missing; do
 		remember_added "$p"
 	done
+	# эти пакеты не запоминаем и при удалении не снимаем: снятие block-mount отмонтирует /overlay и /rom
 	for p in $OPTIONAL; do
-		was=1
-		pkg_present "$p" || was=""
-		if pkg_add "$p"; then
-			[ -n "$was" ] || remember_added "$p"
-		else
-			say "ВНИМАНИЕ: нет пакета $p. Без него может не работать флешка или диагностика"
-		fi
+		pkg_add "$p" || say "ВНИМАНИЕ: нет пакета $p. Без него может не работать флешка или диагностика"
 	done
 }
 

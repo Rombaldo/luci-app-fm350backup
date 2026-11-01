@@ -1,5 +1,5 @@
 #!/bin/sh
-# Удаляет FM350 Backup и то, что поставил её установщик: пакеты, которых не было до установки.
+# Удаляет FM350 Backup и Python с libusb, если их поставил её установщик. Драйверы USB и block-mount остаются.
 # Дампы на флешках и в /root/fm350-backup не трогает.
 #   fm350-uninstall             удалить всё, включая файлы DA
 #   fm350-uninstall --keep-da   оставить файлы DA в /etc/fm350backup/kit
@@ -53,6 +53,10 @@ if [ -n "$ADDED" ]; then
 	for pass in 1 2 3 4; do
 		still=""
 		for p in $left; do
+			# старые версии установщика запоминали и их: снятие block-mount отмонтирует /overlay и /rom
+			case "$p" in
+				block-mount|kmod-*) continue ;;
+			esac
 			remove_package "$p" || still="$still $p"
 		done
 		left="$still"

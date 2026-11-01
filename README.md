@@ -45,7 +45,7 @@ wget -O- https://github.com/Rombaldo/luci-app-fm350backup/releases/latest/downlo
 fm350-uninstall
 ```
 
-Убирает программу, файлы DA и пакеты, которых не было до установки. Дампы на флешке остаются. Оставить файлы DA: `fm350-uninstall --keep-da`.
+Убирает программу, файлы DA, а также Python и libusb, если их не было до установки. Драйверы USB и `block-mount` остаются: они маленькие, а снимать их на работающем роутере опасно. Дампы на флешке остаются. Оставить файлы DA: `fm350-uninstall --keep-da`.
 
 ## Что проверено
 

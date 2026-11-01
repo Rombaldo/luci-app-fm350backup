@@ -277,9 +277,27 @@ class Install(unittest.TestCase):
         self.assertEqual(self.uninstall().returncode, 0)
         log = self.log()
         self.assertIn("apk del python3-logging", log)
-        self.assertIn("apk del kmod-fs-exfat", log)
         self.assertNotIn("apk del python3-light", log)
-        self.assertNotIn("apk del kmod-usb-storage", log)
+
+    def test_block_mount_and_drivers_are_never_removed(self):
+        self.manager("apk")
+        self.run_install()
+        added = read(self.root + "/etc/fm350backup/added-packages").split()
+        self.assertNotIn("block-mount", added)
+        self.assertFalse([p for p in added if p.startswith("kmod-")], added)
+        self.assertEqual(self.uninstall().returncode, 0)
+        self.assertNotIn("apk del block-mount", self.log())
+        self.assertNotIn("apk del kmod-", self.log())
+
+    def test_list_from_older_version_does_not_remove_block_mount(self):
+        self.manager("apk")
+        self.run_install()
+        with open(self.root + "/etc/fm350backup/added-packages", "w") as f:
+            f.write("python3-light\nkmod-usb-storage\nblock-mount\n")
+        self.assertEqual(self.uninstall().returncode, 0)
+        self.assertIn("apk del python3-light", self.log())
+        self.assertNotIn("apk del block-mount", self.log())
+        self.assertNotIn("apk del kmod-usb-storage", self.log())
 
     def test_dependent_packages_are_removed_whatever_the_order(self):
         # python3-light нельзя удалить, пока стоит python3-logging, как на настоящем opkg

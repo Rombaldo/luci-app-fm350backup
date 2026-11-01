@@ -52,4 +52,10 @@ if [ -n "$left" ] || [ -e /usr/bin/python3 ]; then
 	exit 1
 fi
 echo "Python и libusb удалены"
+for p in block-mount kmod-usb-storage; do
+	if ! (apk info -e "$p" 2>/dev/null || opkg status "$p" 2>/dev/null | grep -q ' installed') >/dev/null; then
+		echo "ОШИБКА: удаление сняло $p"
+		exit 1
+	fi
+done
 echo "Установка проверена: $(sed -n "s/^DISTRIB_RELEASE='\(.*\)'/\1/p" /etc/openwrt_release)"
