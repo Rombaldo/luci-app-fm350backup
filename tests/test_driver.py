@@ -7,6 +7,7 @@ import json
 import os
 import random
 import socket
+import subprocess
 import tarfile
 import tempfile
 import threading
@@ -351,32 +352,71 @@ class StreamTar(unittest.TestCase):
         a, b = os.urandom(300000), os.urandom(70001)
         res, files = self.run_tar([self.part("a", len(a), a), self.part("b", len(b), b)], ["b", "a"])
         self.assertEqual(res, ([], [], True))
-        self.assertEqual(files["r/a.bin"], a)
-        self.assertEqual(files["r/b.bin"], b)
-        self.assertIn("cat b.bin a.bin > full_dump.img", files["r/make_full_dump.sh"].decode())
-        self.assertIn("copy /b b.bin+a.bin full_dump.img", files["r/make_full_dump.bat"].decode())
-        self.assertIn(hashlib.md5(a).hexdigest() + "  a.bin", files["r/md5sum.txt"].decode())
+        self.assertEqual(files["r/partitions/a.bin"], a)
+        self.assertEqual(files["r/partitions/b.bin"], b)
+        self.assertIn("cat partitions/b.bin partitions/a.bin > full_dump.img", files["r/" + drv.SCRIPT_LINUX].decode())
+        self.assertIn("copy /b /y partitions\\b.bin+partitions\\a.bin full_dump.img", files["r/" + drv.SCRIPT_WINDOWS].decode())
+        self.assertEqual(files["r/" + drv.SCRIPT_MACOS], files["r/" + drv.SCRIPT_LINUX])
+        self.assertIn("ПРОЧТИ", drv.README_NAME)
+        self.assertIn("full_dump.img", files["r/" + drv.README_NAME].decode("utf-8-sig"))
+        self.assertIn(hashlib.md5(a).hexdigest() + "  a.bin", files["r/partitions/md5sum.txt"].decode())
+
+    def unpack_and_build(self, damage=False):
+        a, b = os.urandom(5000), os.urandom(7000)
+        out = io.BytesIO()
+        res = drv.stream_tar(out, [self.part("a", len(a), a), self.part("b", len(b), b)], ["b", "a"], "r",
+                             lambda: True, lambda k, n: None, {})
+        self.assertEqual(res, ([], [], True))
+        out.seek(0)
+        with tempfile.TemporaryDirectory() as tmp:
+            with tarfile.open(fileobj=out) as t:
+                t.extractall(tmp)
+            top = os.path.join(tmp, "r")
+            self.assertEqual(sorted(os.listdir(top)), sorted([drv.README_NAME, drv.SCRIPT_WINDOWS, drv.SCRIPT_MACOS,
+                                                               drv.SCRIPT_LINUX, "partitions"]))
+            self.assertTrue(os.access(os.path.join(top, drv.SCRIPT_MACOS), os.X_OK))
+            if damage:
+                with open(os.path.join(top, "partitions", "a.bin"), "r+b") as f:
+                    f.write(b"\x00\x01\x02")
+            run = subprocess.run(["sh", os.path.join(top, drv.SCRIPT_LINUX)], capture_output=True, text=True, cwd="/")
+            image = os.path.join(top, "full_dump.img")
+            data = None
+            if os.path.exists(image):
+                with open(image, "rb") as f:
+                    data = f.read()
+            return run, data, b + a
+
+    def test_script_builds_image_in_address_order(self):
+        run, data, want = self.unpack_and_build()
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertEqual(data, want)
+
+    def test_script_refuses_damaged_archive(self):
+        run, data, _ = self.unpack_and_build(damage=True)
+        self.assertNotEqual(run.returncode, 0)
+        self.assertIn("повреждён", run.stdout)
+        self.assertIsNone(data)
 
     def test_pmt_one_byte_short_is_padded_and_counts_as_real(self):
         d = os.urandom(99)
         res, files = self.run_tar([self.part("pmt", 100, d, True, 99)], ["pmt"])
         self.assertEqual(res, ([], [], True))
-        self.assertEqual(files["r/pmt.bin"], d + b"\xff")
+        self.assertEqual(files["r/partitions/pmt.bin"], d + b"\xff")
 
     def test_unread_expdb_is_padded_after_process_dies(self):
         a = os.urandom(1000)
         res, files = self.run_tar([self.part("a", 1000, a), self.part("expdb", 500, None, True)], ["a", "expdb"],
                                   alive=lambda: False)
         self.assertEqual(res, ([], ["expdb"], True))
-        self.assertEqual(files["r/expdb.bin"], b"\xff" * 500)
+        self.assertEqual(files["r/partitions/expdb.bin"], b"\xff" * 500)
 
     def test_stops_after_missing_required_partition(self):
         a = os.urandom(10)
         res, files = self.run_tar([self.part("a", 1000, a), self.part("b", 1000, None)], ["a", "b"], alive=lambda: False)
         self.assertEqual(res, (["a"], [], False))
-        self.assertNotIn("r/b.bin", files)
-        self.assertNotIn("r/make_full_dump.sh", files)
-        self.assertFalse(json.loads(files["r/manifest.json"])["complete"])
+        self.assertNotIn("r/partitions/b.bin", files)
+        self.assertNotIn("r/" + drv.SCRIPT_LINUX, files)
+        self.assertFalse(json.loads(files["r/partitions/manifest.json"])["complete"])
 
 
 class Listener(unittest.TestCase):

@@ -630,12 +630,13 @@ def catch_da(items, st, stream=False):
         time.sleep(4)
         log("power-cycling modem, DA " + name)
         if not gpio_cycle():
-            st["message"] = "Выдерни и вставь модем или переходник с ним: роутер не может сам выключить его питание"
+            st.update(message="Жду, когда переподключишь модем", action="replug")
             write_state(st)
         end = time.time() + 180
         while time.time() < end and proc.poll() is None:
             text = tail_from(LOG, start)
             if BOOTED in text:
+                st.pop("action", None)
                 m = re.findall(r"ME_ID:\s*([0-9A-Fa-f]{16,})", text)
                 if m:
                     st["me_id"] = m[-1].upper()
@@ -950,13 +951,102 @@ class FifoMember:
             self.fd = None
 
 
-def assemble_scripts(order):
-    """Скрипты, которые собирают full_dump.img: разделы лежат в архиве не по адресам."""
-    files = [n + ".bin" for n in order]
-    sh = "#!/bin/sh\n# Собирает full_dump.img из разделов в порядке адресов.\ncd \"$(dirname \"$0\")\" || exit 1\ncat " + \
-         " ".join(files) + " > full_dump.img\n"
-    bat = "@echo off\r\ncd /d \"%~dp0\"\r\ncopy /b " + "+".join(files) + " full_dump.img\r\n"
+PARTS_DIR = "partitions"               # латиница: Windows и SP Flash Tool плохо переносят кириллицу в путях
+SCRIPT_WINDOWS = "Собрать_дамп_Windows.bat"
+SCRIPT_MACOS = "Собрать_дамп_macOS.command"
+SCRIPT_LINUX = "Собрать_дамп_Linux_Ubuntu.sh"
+README_NAME = "ПРОЧТИ.txt"
+
+
+def assemble_scripts(order, image_size):
+    """Скрипты, которые проверяют суммы и собирают full_dump.img: разделы лежат в архиве не по адресам."""
+    files = [PARTS_DIR + "/" + n + ".bin" for n in order]
+    sh = """#!/bin/sh
+# Проверяет контрольные суммы и собирает full_dump.img из разделов в порядке адресов.
+cd "$(dirname "$0")" || exit 1
+echo "Проверяю контрольные суммы, это около минуты..."
+bad=0
+while read -r sum name; do
+	[ -n "$name" ] || continue
+	if command -v md5sum >/dev/null 2>&1; then
+		have=$(md5sum "%(dir)s/$name" | cut -d' ' -f1)
+	else
+		have=$(md5 -q "%(dir)s/$name")
+	fi
+	if [ "$have" != "$sum" ]; then
+		echo "ОШИБКА: файл $name повреждён"
+		bad=1
+	fi
+done < "%(dir)s/md5sum.txt"
+if [ "$bad" != 0 ]; then
+	echo "Полный дамп не собран: архив повреждён. Скачайте дамп заново."
+	exit 1
+fi
+echo "Собираю full_dump.img..."
+cat %(files)s > full_dump.img || exit 1
+size=$(wc -c < full_dump.img | tr -d ' ')
+if [ "$size" != "%(size)d" ]; then
+	echo "ОШИБКА: размер full_dump.img $size байт, ожидалось %(size)d"
+	exit 1
+fi
+echo "Готово: $(pwd)/full_dump.img"
+""" % {"dir": PARTS_DIR, "files": " ".join(files), "size": image_size}
+    # только латиница: в окне cmd кодировка зависит от версии Windows
+    bat = "\r\n".join([
+        "@echo off",
+        "setlocal enabledelayedexpansion",
+        'cd /d "%~dp0"',
+        "echo Checking checksums, about a minute...",
+        "set BAD=0",
+        'for /f "usebackq tokens=1,2" %%a in ("' + PARTS_DIR + '\\md5sum.txt") do call :check %%a %%b',
+        'if not "%BAD%"=="0" (',
+        "  echo ERROR: the archive is damaged, full_dump.img was not made. Download the dump again.",
+        "  pause",
+        "  exit /b 1",
+        ")",
+        "echo Building full_dump.img...",
+        "copy /b /y " + "+".join(f.replace("/", "\\") for f in files) + " full_dump.img >nul",
+        "if errorlevel 1 goto failed",
+        'for %%f in (full_dump.img) do if not "%%~zf"=="' + str(image_size) + '" goto failed',
+        "echo Done: %~dp0full_dump.img",
+        "pause",
+        "exit /b 0",
+        ":failed",
+        "echo ERROR: full_dump.img was not made.",
+        "pause",
+        "exit /b 1",
+        ":check",
+        'set "HAVE="',
+        'for /f "skip=1 delims=" %%h in (\'certutil -hashfile "' + PARTS_DIR + '\\%2" MD5\') do if not defined HAVE set "HAVE=%%h"',
+        'set "HAVE=!HAVE: =!"',
+        'if /i not "!HAVE!"=="%1" (',
+        "  echo ERROR: %2 is damaged",
+        "  set BAD=1",
+        ")",
+        "exit /b 0",
+        "",
+    ])
     return sh, bat
+
+
+def archive_readme(padded):
+    note = "\nЖурнал сбоев expdb прочитан не целиком, недочитанное заполнено байтами FF. Программа считает, что для восстановления он не нужен.\n" \
+        if "expdb" in padded else ""
+    return """Полный дамп модема FM350-GL
+
+Чтобы получить один файл full_dump.img, запустите файл для своей системы:
+
+  Windows        Собрать_дамп_Windows.bat, двойной щелчок
+  macOS          Собрать_дамп_macOS.command, правая кнопка мыши, Открыть
+  Linux, Ubuntu  в терминале: sh Собрать_дамп_Linux_Ubuntu.sh
+
+Программа проверит контрольные суммы и положит full_dump.img рядом с этим файлом.
+Нужно примерно 600 МБ свободного места.
+
+Отдельные разделы лежат в папке partitions.
+%s
+Не выкладывайте дамп в открытый доступ: в нём IMEI, серийный номер и настройки вашего модема.
+""" % note
 
 
 def add_bytes(tar, name, data, mode=0o600):
@@ -973,7 +1063,7 @@ def stream_tar(out, parts, order, root, alive, progress, info):
     tar = tarfile.open(fileobj=out, mode="w|", format=tarfile.GNU_FORMAT)
     md5lines, pj, missing, padded = [], [], [], []
     for p in parts:
-        ti = tarfile.TarInfo(root + "/" + p["name"] + ".bin")
+        ti = tarfile.TarInfo(root + "/" + PARTS_DIR + "/" + p["name"] + ".bin")
         ti.size = p["size"]
         ti.mtime = int(time.time())
         ti.mode = 0o600
@@ -987,15 +1077,17 @@ def stream_tar(out, parts, order, root, alive, progress, info):
         if missing:
             break
     pmt_real = not missing and "pmt" not in padded
-    add_bytes(tar, root + "/md5sum.txt", ("\n".join(md5lines) + "\n").encode())
-    add_bytes(tar, root + "/manifest.json", json.dumps(dict(
+    add_bytes(tar, root + "/" + PARTS_DIR + "/md5sum.txt", ("\n".join(md5lines) + "\n").encode())
+    add_bytes(tar, root + "/" + PARTS_DIR + "/manifest.json", json.dumps(dict(
         info, created=time.strftime("%Y-%m-%d %H:%M:%S"), tool="FM350 Backup для роутера", complete=not missing,
         pmt_real=pmt_real, full_dump_img=False, missing=missing, padded=padded, partitions=pj),
         indent=2, ensure_ascii=False).encode())
     if not missing and pmt_real:
-        sh, bat = assemble_scripts(order)
-        add_bytes(tar, root + "/make_full_dump.sh", sh.encode(), 0o755)
-        add_bytes(tar, root + "/make_full_dump.bat", bat.encode(), 0o644)
+        sh, bat = assemble_scripts(order, sum(p["size"] for p in parts))
+        add_bytes(tar, root + "/" + SCRIPT_WINDOWS, bat.encode(), 0o644)
+        add_bytes(tar, root + "/" + SCRIPT_MACOS, sh.encode(), 0o755)
+        add_bytes(tar, root + "/" + SCRIPT_LINUX, sh.encode(), 0o755)
+        add_bytes(tar, root + "/" + README_NAME, b"\xef\xbb\xbf" + archive_readme(padded).replace("\n", "\r\n").encode(), 0o644)
     tar.close()
     return missing, padded, pmt_real
 

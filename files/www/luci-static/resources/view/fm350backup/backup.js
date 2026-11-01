@@ -26,6 +26,8 @@ var STYLE =
 	'.fm-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px 20px}' +
 	'.fm-v{font-size:14px;margin:0;overflow-wrap:anywhere}.fm-mono{font-family:monospace;font-size:13px}' +
 	'.fm-note{font-size:13px;padding:10px 12px;border-radius:8px;background:var(--fm-soft);margin:14px 0 0}' +
+	'.fm-alert{border:2px solid var(--fm-warn);border-radius:12px;padding:18px 20px;margin-bottom:14px;background:var(--fm-soft)}' +
+	'.fm-alert b{display:block;font-size:20px;margin-bottom:6px;color:var(--fm-warn)}.fm-alert p{margin:0;font-size:14px}' +
 	'.fm-note.warn{color:var(--fm-warn)}.fm-note.bad{color:var(--fm-bad)}.fm-note.ok{color:var(--fm-ok)}' +
 	'.fm-opts{display:grid;gap:8px;margin:8px 0 14px}' +
 	'.fm-opt{display:block;text-align:left;width:100%;height:auto;background:none;color:inherit;border:1px solid var(--fm-line);border-radius:8px;padding:10px 12px;cursor:pointer;font:inherit}' +
@@ -142,8 +144,13 @@ return view.extend({
 			? [ 'run', last.message, last.done, last.total, last.dest, this.streamUrl ]
 			: [ 'idle', last.phase, last.message, last.outdir, last.started, this.dismissed, this.dest, st.drives, st.ready, st.mode, st.das, this.daMessage ],
 			function () {
-				if (active) return [ self.progressCard(last) ];
+				if (active) return (last.action === 'replug' ? [ self.alertCard('Выдерни и вставь модем',
+					'Выдерни модем или USB-переходник с ним, подожди 2–3 секунды и вставь обратно. На это есть примерно 3 минуты, дальше программа продолжит сама.') ] : []).concat([ self.progressCard(last) ]);
 				var c = [];
+				// только пока модем и правда в загрузчике: итог прошлого дампа хранится и после переподключения
+				if (last.finished && last.phase === 'done' && st.mode === 'bootloader')
+					c.push(self.alertCard('Дамп готов. Верни модем в работу',
+						'Модем остался в режиме загрузчика. Выключи роутер из розетки на 10 секунд и включи. Если модем в USB-переходнике, достаточно выдернуть и вставить переходник.'));
 				if (last.finished && last.started !== self.dismissed) c.push(self.resultCard(last));
 				c.push(self.startCard(st));
 				c.push(self.daCard(st));
@@ -205,7 +212,7 @@ return view.extend({
 			}, [ E('b', {}, title), E('span', { class: 'fm-hint' }, hint) ]);
 		}
 
-		var opts = [ opt('pc', 'На этот компьютер', 'Сразу скачивается архивом, на роутере места не занимает') ];
+		var opts = [ opt('pc', 'На этот компьютер', 'Скачивается архивом, в нём файлы для сборки полного дампа на Windows, macOS и Linux. На роутере места не занимает') ];
 		drives.forEach(function (d) {
 			var ok = usable.indexOf(d) >= 0;
 			opts.push(opt(d.path, 'На флешку ' + d.path + ', ' + (d.free_mb / 1024).toFixed(1).replace('.', ',') + ' ГБ свободно',
@@ -272,6 +279,10 @@ return view.extend({
 		return text;
 	},
 
+	alertCard: function (title, text) {
+		return E('div', { class: 'fm-alert', role: 'alert' }, [ E('b', {}, title), E('p', {}, text) ]);
+	},
+
 	progressCard: function (last) {
 		var pct = last.total ? Math.min(100, Math.floor(100 * (last.done || 0) / last.total)) : 0;
 		var kids = [
@@ -293,11 +304,14 @@ return view.extend({
 
 	resultCard: function (last) {
 		var self = this, ok = last.phase === 'done' && last.complete !== false && last.pmt_real !== false;
-		var kids = [ E('p', { class: 'fm-note ' + (ok ? 'ok' : 'bad'), style: 'margin:0' }, last.message || '') ];
+		// что делать с модемом говорит отдельная табличка, и только когда это нужно
+		var text = (last.message || '').split(' Чтобы модем снова заработал')[0];
+		var when = last.started ? new Date(last.started * 1000).toLocaleString() + '. ' : '';
+		var kids = [ E('p', { class: 'fm-note ' + (ok ? 'ok' : 'bad'), style: 'margin:0' }, (ok ? 'Прошлый дамп, ' + when : '') + text) ];
 		if (ok && last.dest === 'usb' && last.outdir)
 			kids.push(E('p', { class: 'fm-hint', style: 'margin-top:8px' }, 'Папка: ' + last.outdir));
 		if (ok && last.dest === 'pc')
-			kids.push(E('p', { class: 'fm-hint', style: 'margin-top:8px' }, 'В архиве есть make_full_dump.sh и make_full_dump.bat: они собирают из разделов один образ full_dump.img.'));
+			kids.push(E('p', { class: 'fm-hint', style: 'margin-top:8px' }, 'Распакуй архив и запусти файл для своей системы: он соберёт полный дамп full_dump.img. Подробности в ПРОЧТИ.txt внутри архива.'));
 		kids.push(E('div', { class: 'fm-btns', style: 'margin-top:10px' }, [
 			E('button', { class: 'cbi-button', click: function () { self.dismissed = last.started; self.update(self.st); } }, 'Скрыть')
 		]));
